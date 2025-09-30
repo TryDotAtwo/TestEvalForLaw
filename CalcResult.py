@@ -9,6 +9,10 @@ import logging
 import sys
 import time
 import re  # NEW: для sanitize
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt  # NEW: для графиков
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Файл для чтения и вывода
 input_file = 'merged_output_with_expert_eval_all.json'
-output_file = 'metrics_analysis.json'
+output_file = 'metrics_analysis(2).json'
 
 # Загрузка данных
 try:
@@ -272,6 +276,32 @@ def compute_expert_correlations(block_df):
             result[metric] = (None, None)
     return result
 
+def plot_bland_altman(x, y, title, filename):
+    x = np.array(x)
+    y = np.array(y)
+    mask = ~np.isnan(x) & ~np.isnan(y)
+    x = x[mask]
+    y = y[mask]
+    if len(x) < 2:
+        logger.warning(f"Недостаточно данных для графика Bland-Altman: {filename}")
+        return
+    mean = (x + y) / 2
+    diff = x - y
+    bias = np.mean(diff)
+    sd = np.std(diff)
+    plt.figure()
+    plt.scatter(mean, diff)
+    plt.axhline(bias, color='red', label='Bias')
+    plt.axhline(bias + 1.96 * sd, color='gray', linestyle='--', label='Upper LoA')
+    plt.axhline(bias - 1.96 * sd, color='gray', linestyle='--', label='Lower LoA')
+    plt.title(title)
+    plt.xlabel('Mean')
+    plt.ylabel('Difference')
+    plt.legend()
+    plt.savefig(filename)
+    plt.close()
+    logger.info(f"Сохранён график Bland-Altman: {filename}")
+
 # 2. Статистики для блочных метрик
 block_stats = {}
 for metric in block_metrics:
@@ -280,6 +310,36 @@ for metric in block_metrics:
     for key, (r, p) in corr_dict.items():
         global_stats[f'{key} r'] = r
         global_stats[f'{key} p'] = p
+    
+    # Дополнительно: CCC, MAE и Bland-Altman для глобальных (усреднённых по документу) блочных метрик
+    pairs = doc_correlation_pairs_block_metrics[metric]
+    pairs = [(m, e) for m, e in pairs if not (np.isnan(m) or np.isnan(e))]
+    if len(pairs) > 1:
+        metrics_vals, expert_vals = zip(*pairs)
+        min_v_m, max_v_m = metric_ranges.get(metric, (None, None))
+        min_v_e, max_v_e = metric_ranges.get('expert_score', (None, None))
+        norm_metrics = minmax_scale_array(metrics_vals, min_v_m, max_v_m)
+        norm_experts = minmax_scale_array(expert_vals, min_v_e, max_v_e)
+        if np.nanstd(norm_metrics) > 0 and np.nanstd(norm_experts) > 0:
+            pearson_corr = pearsonr(norm_metrics, norm_experts)[0]
+            mu_m = np.nanmean(norm_metrics)
+            mu_e = np.nanmean(norm_experts)
+            sigma_m = np.nanstd(norm_metrics)
+            sigma_e = np.nanstd(norm_experts)
+            ccc = 2 * pearson_corr * sigma_m * sigma_e / (sigma_m**2 + sigma_e**2 + (mu_m - mu_e)**2)
+            global_stats['Lin CCC'] = float(ccc) if not np.isnan(ccc) else None
+        else:
+            global_stats['Lin CCC'] = None
+        mae = np.nanmean(np.abs(norm_metrics - norm_experts))
+        global_stats['MAE'] = float(mae) if not np.isnan(mae) else None
+        
+        safe_metric = re.sub(r'\W+', '_', metric)
+        filename = f"bland_altman_global_{safe_metric}.png"
+        plot_bland_altman(norm_metrics, norm_experts, f"Bland-Altman Plot for Global Avg {metric}", filename)
+    else:
+        global_stats['Lin CCC'] = None
+        global_stats['MAE'] = None
+
     block_stats[metric] = {'global': global_stats}
     per_block = {}
     for block_name in blocks:
@@ -290,6 +350,37 @@ for metric in block_metrics:
             stats[f'{key} p'] = p
         avg_num = np.mean(expert_lens_per_block[block_name]) if expert_lens_per_block[block_name] else np.nan
         stats['Среднее число экспертов'] = float(avg_num) if not np.isnan(avg_num) else None
+        
+        # Дополнительно: CCC, MAE и Bland-Altman для per_block
+        pairs = block_correlation_pairs[block_name][metric]
+        pairs = [(m, e) for m, e in pairs if not (np.isnan(m) or np.isnan(e))]
+        if len(pairs) > 1:
+            metrics_vals, expert_vals = zip(*pairs)
+            min_v_m, max_v_m = metric_ranges.get(metric, (None, None))
+            min_v_e, max_v_e = metric_ranges.get('expert_score', (None, None))
+            norm_metrics = minmax_scale_array(metrics_vals, min_v_m, max_v_m)
+            norm_experts = minmax_scale_array(expert_vals, min_v_e, max_v_e)
+            if np.nanstd(norm_metrics) > 0 and np.nanstd(norm_experts) > 0:
+                pearson_corr = pearsonr(norm_metrics, norm_experts)[0]
+                mu_m = np.nanmean(norm_metrics)
+                mu_e = np.nanmean(norm_experts)
+                sigma_m = np.nanstd(norm_metrics)
+                sigma_e = np.nanstd(norm_experts)
+                ccc = 2 * pearson_corr * sigma_m * sigma_e / (sigma_m**2 + sigma_e**2 + (mu_m - mu_e)**2)
+                stats['Lin CCC'] = float(ccc) if not np.isnan(ccc) else None
+            else:
+                stats['Lin CCC'] = None
+            mae = np.nanmean(np.abs(norm_metrics - norm_experts))
+            stats['MAE'] = float(mae) if not np.isnan(mae) else None
+            
+            safe_block = re.sub(r'\W+', '_', block_name)
+            safe_metric = re.sub(r'\W+', '_', metric)
+            filename = f"bland_altman_{safe_block}_{safe_metric}.png"
+            plot_bland_altman(norm_metrics, norm_experts, f"Bland-Altman Plot for {metric} in {block_name}", filename)
+        else:
+            stats['Lin CCC'] = None
+            stats['MAE'] = None
+
         per_block[block_name] = stats
     block_stats[metric]['per_block'] = per_block
 
@@ -401,6 +492,36 @@ for metric in doc_metrics:
     for key, (r, p) in corr_dict.items():
         stats[f'{key} r'] = r
         stats[f'{key} p'] = p
+    
+    # Дополнительно: CCC, MAE и Bland-Altman для документных метрик
+    pairs = doc_correlation_pairs[metric]
+    pairs = [(m, e) for m, e in pairs if not (np.isnan(m) or np.isnan(e))]
+    if len(pairs) > 1:
+        metrics_vals, expert_vals = zip(*pairs)
+        min_v_m, max_v_m = metric_ranges.get(metric, (None, None))
+        min_v_e, max_v_e = metric_ranges.get('expert_score', (None, None))
+        norm_metrics = minmax_scale_array(metrics_vals, min_v_m, max_v_m)
+        norm_experts = minmax_scale_array(expert_vals, min_v_e, max_v_e)
+        if np.nanstd(norm_metrics) > 0 and np.nanstd(norm_experts) > 0:
+            pearson_corr = pearsonr(norm_metrics, norm_experts)[0]
+            mu_m = np.nanmean(norm_metrics)
+            mu_e = np.nanmean(norm_experts)
+            sigma_m = np.nanstd(norm_metrics)
+            sigma_e = np.nanstd(norm_experts)
+            ccc = 2 * pearson_corr * sigma_m * sigma_e / (sigma_m**2 + sigma_e**2 + (mu_m - mu_e)**2)
+            stats['Lin CCC'] = float(ccc) if not np.isnan(ccc) else None
+        else:
+            stats['Lin CCC'] = None
+        mae = np.nanmean(np.abs(norm_metrics - norm_experts))
+        stats['MAE'] = float(mae) if not np.isnan(mae) else None
+        
+        safe_metric = re.sub(r'\W+', '_', metric)
+        filename = f"bland_altman_doc_{safe_metric}.png"
+        plot_bland_altman(norm_metrics, norm_experts, f"Bland-Altman Plot for Doc {metric}", filename)
+    else:
+        stats['Lin CCC'] = None
+        stats['MAE'] = None
+
     doc_stats[metric] = stats
 
 doc_expert_stats = compute_stats(doc_avg_experts, 'expert_score')
